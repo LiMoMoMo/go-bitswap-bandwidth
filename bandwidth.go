@@ -14,6 +14,9 @@ const (
 	interval = time.Second
 )
 
+type message interface {
+	handle(bd *BandWidth)
+}
 type blkRecv struct {
 	cid  cid.Cid
 	from peer.ID
@@ -26,50 +29,58 @@ type blksSend struct {
 	cids int
 }
 
+type exitCheck struct {
+	peerID peer.ID
+	resp   chan bool
+}
+
+type PartialRequest struct {
+	Peers []peer.ID
+	Keys  []cid.Cid
+}
+
+type splitRequestMessage struct {
+	ps   []peer.ID
+	ks   []cid.Cid
+	resp chan []*PartialRequest
+}
+
 // BandWidth count peer's bandwidth
 type BandWidth struct {
-	ctx        context.Context
-	incoming   chan blkRecv
-	sendcoming chan blksSend
+	ctx      context.Context
+	incoming chan message
 
 	data map[peer.ID]int // receive data size
 
 	tdata map[peer.ID]time.Time // start timestamp
 
+	cLck  sync.Mutex      // Lock for cdata
 	cdata map[peer.ID]int // cids count
 
 	sLck  sync.Mutex      // lock for sdata
 	sdata map[peer.ID]int // bandwidth for peers
-	tick  *time.Timer
 }
 
 // New returns an ptr of BandWidth
 func New(ctx context.Context) *BandWidth {
 	s := &BandWidth{
-		ctx:        ctx,
-		incoming:   make(chan blkRecv),
-		sendcoming: make(chan blksSend),
-		data:       make(map[peer.ID]int),
-		tdata:      make(map[peer.ID]time.Time),
-		cdata:      make(map[peer.ID]int),
-		sdata:      make(map[peer.ID]int),
+		ctx:      ctx,
+		incoming: make(chan message),
+		data:     make(map[peer.ID]int),
+		tdata:    make(map[peer.ID]time.Time),
+		cdata:    make(map[peer.ID]int),
+		sdata:    make(map[peer.ID]int),
 	}
 	return s
 }
 
 // Start Bandwidth module
 func (bd *BandWidth) Start() {
-	bd.tick = time.NewTimer(5 * interval)
 	for {
 		select {
-		case blk := <-bd.incoming:
-			bd.handleIncoming(blk)
-		case blks := <-bd.sendcoming:
-			bd.handleSendcoming(blks)
-		case <-bd.tick.C:
-			bd.handleTick()
+		case msg := <-bd.incoming:
+			msg.handle(bd)
 		case <-bd.ctx.Done():
-			bd.tick.Stop()
 			return
 		}
 	}
@@ -77,19 +88,54 @@ func (bd *BandWidth) Start() {
 
 // ReceiveBlock called by blocks in
 func (bd *BandWidth) ReceiveBlock(from peer.ID, size int, last time.Duration) {
-	bd.incoming <- blkRecv{from: from, size: size, last: last}
+	bd.incoming <- &blkRecv{from: from, size: size, last: last}
 }
 
 // SendBlocks start bandwidth detect.
 func (bd *BandWidth) SendBlocks(from peer.ID, blocks int) {
-	bd.sendcoming <- blksSend{from: from, cids: blocks}
+	bd.incoming <- &blksSend{from: from, cids: blocks}
 }
 
-func (bd *BandWidth) handleTick() {
+// Has return whether the peer is tranfering data.
+func (bd *BandWidth) Has(p peer.ID) bool {
+	// bd.cLck.Lock()
+	// defer bd.cLck.Unlock()
+	// _, ok := bd.cdata[p]
+	// return ok
 
+	response := make(chan bool, 1)
+
+	select {
+	case bd.incoming <- &exitCheck{resp: response, peerID: p}:
+	case <-bd.ctx.Done():
+		return false
+	}
+	select {
+	case resp := <-response:
+		return resp
+	case <-bd.ctx.Done():
+		return false
+	}
 }
 
-func (bd *BandWidth) handleIncoming(blk blkRecv) {
+// Split split cids up to bandwidth.
+func (bd *BandWidth) Split(ps []peer.ID, ks []cid.Cid) []*PartialRequest {
+	resp := make(chan []*PartialRequest, 1)
+
+	select {
+	case bd.incoming <- &splitRequestMessage{ps, ks, resp}:
+	case <-bd.ctx.Done():
+		return nil
+	}
+	select {
+	case splitRequests := <-resp:
+		return splitRequests
+	case <-bd.ctx.Done():
+		return nil
+	}
+}
+
+func (blk *blkRecv) handle(bd *BandWidth) {
 	bd.cdata[blk.from]--
 	bd.data[blk.from] += blk.size
 
@@ -112,24 +158,20 @@ func (bd *BandWidth) handleIncoming(blk blkRecv) {
 	}
 }
 
-func (bd *BandWidth) handleSendcoming(blk blksSend) {
-	bd.tdata[blk.from] = time.Now()
-	bd.cdata[blk.from] += blk.cids
-	bd.data[blk.from] = 0
+func (blks *blksSend) handle(bd *BandWidth) {
+	bd.tdata[blks.from] = time.Now()
+	bd.cdata[blks.from] += blks.cids
+	bd.data[blks.from] = 0
 }
 
-// Has return whether the peer is tranfering data.
-func (bd *BandWidth) Has(p peer.ID) bool {
-	_, ok := bd.cdata[p]
-	return ok
+func (has *exitCheck) handle(bd *BandWidth) {
+	_, ok := bd.cdata[has.peerID]
+	has.resp <- ok
 }
 
-// Split split cids up to bandwidth.
-func (bd *BandWidth) Split(ps []peer.ID, ks []cid.Cid) map[peer.ID][]cid.Cid {
-	bd.sLck.Lock()
-	bd.sLck.Unlock()
-	values := make(map[peer.ID][]cid.Cid)
-	getPer := func(val int) float32 {
+func (s *splitRequestMessage) handle(bd *BandWidth) {
+	splitRequests := make([]*PartialRequest, len(s.ps))
+	getPercent := func(val int) float32 {
 		sum := 0
 		for _, v := range bd.sdata {
 			sum += v
@@ -152,45 +194,47 @@ func (bd *BandWidth) Split(ps []peer.ID, ks []cid.Cid) map[peer.ID][]cid.Cid {
 		}
 		return true
 	}
-	if len(ps) == 0 {
-		return values
+	if len(s.ps) == 0 {
+		s.resp <- splitRequests
+		return
 	}
-	if !checkZero(ps) {
-		splits := make([][]cid.Cid, len(ps))
-		for i, c := range ks {
-			pos := i % len(ps)
+	if !checkZero(s.ps) {
+		splits := make([][]cid.Cid, len(s.ps))
+		for i, c := range s.ks {
+			pos := i % len(s.ps)
 			splits[pos] = append(splits[pos], c)
 		}
 		index := 0
-		for _, v := range ps {
-			values[v] = splits[index]
+		for _, v := range s.ps {
+			splitRequests[index] = &PartialRequest{[]peer.ID{v}, splits[index]}
 			index++
 		}
 	} else {
 		start := 0
-		var index peer.ID
-		for _, v := range ps {
-			index = v
-			if start >= len(ks) {
+		index := 0
+		for _, v := range s.ps {
+
+			if start >= len(s.ks) {
 				break
 			}
-			count := getPer(bd.sdata[v]) * float32(len(ks))
+			count := getPercent(bd.sdata[v]) * float32(len(s.ks))
 			if count == 0 {
-				return values
+				s.resp <- splitRequests
 			}
 			end := start + int(count)
-			fmt.Println(len(ks), v.Pretty(), start, end)
-			if end > len(ks) {
-				values[v] = ks[start:]
+			fmt.Println(len(s.ks), v.Pretty(), start, end)
+			if end > len(s.ks) {
+				splitRequests[index] = &PartialRequest{[]peer.ID{v}, s.ks[start:]}
 				break
 			}
-			values[v] = ks[start:end]
+			splitRequests[index] = &PartialRequest{[]peer.ID{v}, s.ks[start:end]}
 			start = end
+			index++
 		}
-		if start < len(ks) {
-			values[index] = append(values[index], ks[start:]...)
+		if start < len(s.ks) {
+			splitRequests[index].Keys = append(splitRequests[index].Keys, s.ks[start:]...)
 		}
 	}
 
-	return values
+	s.resp <- splitRequests
 }
