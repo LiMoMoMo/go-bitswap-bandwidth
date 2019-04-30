@@ -3,7 +3,6 @@ package bandwidth
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	cid "github.com/ipfs/go-cid"
@@ -54,10 +53,8 @@ type BandWidth struct {
 
 	tdata map[peer.ID]time.Time // start timestamp
 
-	cLck  sync.Mutex      // Lock for cdata
 	cdata map[peer.ID]int // cids count
 
-	sLck  sync.Mutex      // lock for sdata
 	sdata map[peer.ID]int // bandwidth for peers
 }
 
@@ -98,11 +95,6 @@ func (bd *BandWidth) SendBlocks(from peer.ID, blocks int) {
 
 // Has return whether the peer is tranfering data.
 func (bd *BandWidth) Has(p peer.ID) bool {
-	// bd.cLck.Lock()
-	// defer bd.cLck.Unlock()
-	// _, ok := bd.cdata[p]
-	// return ok
-
 	response := make(chan bool, 1)
 
 	select {
@@ -144,8 +136,6 @@ func (blk *blkRecv) handle(bd *BandWidth) {
 		if ok {
 			elaspe := time.Since(start).Seconds()
 			speed := float64(bd.data[blk.from]) / elaspe
-			bd.sLck.Lock()
-			bd.sLck.Unlock()
 			bandw, ok := bd.sdata[blk.from]
 			if ok {
 				bd.sdata[blk.from] = (bandw + int(speed/1024)) / 2
